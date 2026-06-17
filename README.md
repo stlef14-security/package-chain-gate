@@ -108,8 +108,18 @@ cargo llvm-cov --html
 cargo llvm-cov --lcov --output-path lcov.info
 ```
 
-> If a Homebrew-installed Rust toolchain shadows `rustup` on your `PATH`, run the
-> commands through the pinned toolchain instead, e.g.
+> **Homebrew Rust note.** If your `rustc`/`cargo` come from Homebrew, they ship
+> without `llvm-tools`, and `cargo llvm-cov` fails with *"failed to find
+> llvm-tools-preview"*. Point it at the rustup toolchain's copies by exporting
+> `LLVM_COV` and `LLVM_PROFDATA` (add to your shell profile to make it permanent):
+>
+> ```sh
+> tools="$(rustup run 1.94 rustc --print target-libdir)/../bin"
+> export LLVM_COV="$tools/llvm-cov"
+> export LLVM_PROFDATA="$tools/llvm-profdata"
+> ```
+>
+> Alternatively, run the command through the pinned toolchain directly:
 > `rustup run 1.94 cargo llvm-cov --summary-only`.
 
 ## Linting & formatting
