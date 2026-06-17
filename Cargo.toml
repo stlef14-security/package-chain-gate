@@ -1,0 +1,22 @@
+[package]
+name = "package-chain-gate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "A gate for detecting supply-chain risks (malware, typosquatting, dependency confusion) in package dependencies."
+license = "MIT"
+readme = "README.md"
+repository = ""
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+strip = true
