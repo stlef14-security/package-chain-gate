@@ -9,6 +9,8 @@ readme = "README.md"
 repository = ""
 
 [dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "macros"] }
 
 [lints.rust]
 unsafe_code = "forbid"

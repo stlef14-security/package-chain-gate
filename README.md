@@ -22,12 +22,25 @@ cargo build --release
 
 ## Run
 
+`package-chain-gate` listens for npm package manager proxy requests on a port,
+screening packages before forwarding to the npm registry. The listening port is
+configured with the optional `--proxy-port` option, which defaults to `4873`.
+
 ```sh
-# Run via cargo
+# Run via cargo (listens on the default port 4873)
 cargo run
 
+# Specify a custom port
+cargo run -- --proxy-port 8080
+
 # Or run the compiled binary directly
-./target/debug/package-chain-gate
+./target/debug/package-chain-gate --proxy-port 4873
+```
+
+Point npm at the gate by setting its registry to the listening address:
+
+```sh
+npm config set registry http://localhost:4873/
 ```
 
 ## Test
