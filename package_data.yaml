@@ -1,14 +1,17 @@
-malware:
-  packages:
-    - pkg:npm/axios@1.9.3
-    - pkg:npm/lodash@4.17.21
-    - pkg:npm/react@18.3.1
-    - pkg:pypi/moto@4.2.14
-typosquatting:
-  packages:
-    - pkg:npm/lodash-clik@1.0.1
-    - pkg:npm/react-router-dom-proxy@1.0.1
-    - pkg:pypi/msrest@0.7.1
-dependency_confusion:
-  packages:
-    - pkg:npm/ axios@1.9.3
+packages:
+  - pkg:npm/axios@1.9.3:
+    - malware
+    - dependency_confusion
+  - pkg:npm/lodash@4.17.21:
+    - malware
+  - pkg:npm/react@18.3.1:
+    - malware
+    - typosquatting
+  - pkg:pypi/moto@4.2.14:
+    - malware
+  - pkg:npm/lodash-clik@1.0.1:
+    - typosquatting
+  - pkg:npm/react-router-dom-proxy@1.0.1:
+    - typosquatting
+  - pkg:pypi/msrest@0.7.1:
+    - typosquatting

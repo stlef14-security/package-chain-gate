@@ -1,0 +1,4 @@
+policy:
+  malware: block
+  typosquatting: block
+  dependency_confusion: block

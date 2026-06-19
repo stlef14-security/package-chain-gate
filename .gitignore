@@ -7,3 +7,6 @@
 # Local environment / editor
 .env
 *.local.yaml
+
+# Agent or features specific files
+features.md
