@@ -33,9 +33,16 @@ cargo run
 # Specify a custom port
 cargo run -- --proxy-port 8080
 
+# Load package vulnerability data for lookups
+cargo run -- --package-config package_data.yaml
+
 # Or run the compiled binary directly
 ./target/debug/package-chain-gate --proxy-port 4873
 ```
+
+The optional `--package-config <PATH>` option loads a YAML file of known
+vulnerable packages into an in-memory model keyed by purl (see
+[Configuration](#configuration)).
 
 Point npm at the gate by setting its registry to the listening address:
 
@@ -137,6 +144,20 @@ cargo clippy
 
 ## Configuration
 
-See [`config.example.yaml`](config.example.yaml) for the expected configuration
-format. Packages are identified using [purl](https://github.com/package-url/purl-spec)
-identifiers (e.g. `pkg:npm/lodash@4.17.21`).
+The `--package-config` file lists known vulnerable packages. Each package is
+identified by its [purl](https://github.com/package-url/purl-spec) and mapped to
+one or more vulnerability types (`malware`, `typosquatting`,
+`dependency_confusion`). See [`package_data.yaml`](package_data.yaml) for a
+complete example:
+
+```yaml
+packages:
+  - pkg:npm/axios@1.9.3:
+    - malware
+    - dependency_confusion
+  - pkg:npm/lodash@4.17.21:
+    - malware
+```
+
+On startup the file is parsed into an in-memory model that supports lookups by
+purl. (Acting on those lookups to block requests is a later step.)
