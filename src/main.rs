@@ -1,4 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -11,6 +13,10 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use reqwest::Method;
 use tokio::net::{TcpListener, TcpStream};
+
+mod package_data;
+
+use package_data::PackageData;
 
 /// Upstream npm registry that allowed requests are forwarded to.
 const NPM_REGISTRY: &str = "https://registry.npmjs.org";
@@ -25,6 +31,10 @@ struct Cli {
     /// Port to listen on for npm proxy requests.
     #[arg(long, value_name = "PORT", default_value_t = 4873)]
     proxy_port: u16,
+
+    /// Path to the package vulnerability data file (YAML).
+    #[arg(long, value_name = "PATH")]
+    package_config: Option<PathBuf>,
 }
 
 /// Builds the local address the proxy listens on for the given port.
@@ -39,6 +49,12 @@ async fn main() -> Result<(), BoxError> {
 
 /// Binds the proxy listener and serves requests until the process is stopped.
 async fn run(cli: Cli) -> Result<(), BoxError> {
+    let package_data = load_package_data(cli.package_config.as_deref())?;
+    println!(
+        "loaded vulnerability data for {} package(s)",
+        package_data.package_count()
+    );
+
     let listener = TcpListener::bind(listen_addr(cli.proxy_port)).await?;
     println!(
         "package-chain-gate listening for npm proxy requests on {} (upstream: {NPM_REGISTRY})",
@@ -46,6 +62,15 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
     );
 
     serve(listener, reqwest::Client::new(), Arc::from(NPM_REGISTRY)).await
+}
+
+/// Loads package vulnerability data from the given path, or returns an empty
+/// data set when no path is configured.
+fn load_package_data(path: Option<&Path>) -> Result<PackageData, BoxError> {
+    match path {
+        Some(path) => PackageData::from_file(path),
+        None => Ok(PackageData::default()),
+    }
 }
 
 /// Runs the accept loop, serving each accepted connection on its own task.
@@ -232,6 +257,46 @@ mod tests {
     }
 
     #[test]
+    fn package_config_defaults_to_none() {
+        let cli = Cli::try_parse_from(["package-chain-gate"]).unwrap();
+        assert!(cli.package_config.is_none());
+    }
+
+    #[test]
+    fn package_config_parses_path() {
+        let cli =
+            Cli::try_parse_from(["package-chain-gate", "--package-config", "data.yaml"]).unwrap();
+        assert_eq!(cli.package_config.as_deref(), Some(Path::new("data.yaml")));
+    }
+
+    #[test]
+    fn load_package_data_returns_empty_without_path() {
+        let data = load_package_data(None).unwrap();
+        assert_eq!(data.package_count(), 0);
+    }
+
+    #[test]
+    fn load_package_data_reads_from_file() {
+        let path = std::env::temp_dir().join(format!("pcg-main-{}.yaml", std::process::id()));
+        std::fs::write(
+            &path,
+            "packages:\n  - pkg:npm/lodash@4.17.21:\n    - malware\n",
+        )
+        .unwrap();
+
+        let data = load_package_data(Some(&path)).unwrap();
+        assert_eq!(data.package_count(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_package_data_errors_for_missing_file() {
+        let path = Path::new("/nonexistent/pcg-missing.yaml");
+        assert!(load_package_data(Some(path)).is_err());
+    }
+
+    #[test]
     fn listen_addr_binds_localhost_with_given_port() {
         let addr = listen_addr(4873);
         assert_eq!(addr.ip(), Ipv4Addr::LOCALHOST);
@@ -259,8 +324,14 @@ mod tests {
     async fn run_binds_and_serves_until_cancelled() {
         // Port 0 lets the OS assign a free port. `run` serves forever, so it is
         // cancelled by the timeout once it is up and accepting.
-        let outcome =
-            tokio::time::timeout(Duration::from_millis(100), run(Cli { proxy_port: 0 })).await;
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            run(Cli {
+                proxy_port: 0,
+                package_config: None,
+            }),
+        )
+        .await;
         assert!(
             outcome.is_err(),
             "run() should still be serving when cancelled"
