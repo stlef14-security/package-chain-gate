@@ -14,6 +14,18 @@ pub enum Vulnerability {
     DependencyConfusion,
 }
 
+impl Vulnerability {
+    /// The vulnerability's name as it appears in the data file.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Malware => "malware",
+            Self::Typosquatting => "typosquatting",
+            Self::DependencyConfusion => "dependency_confusion",
+        }
+    }
+}
+
 /// In-memory model of package vulnerability data, keyed by [purl].
 ///
 /// Built from a YAML file and used to look up whether a package pulled through
@@ -49,7 +61,6 @@ impl PackageData {
     /// Looks up the vulnerabilities recorded for a package by its purl,
     /// returning `None` when the package is not present in the data.
     #[must_use]
-    #[allow(dead_code, reason = "consumed in step 2 to block vulnerable packages")]
     pub fn lookup(&self, purl: &str) -> Option<&HashSet<Vulnerability>> {
         self.packages.get(purl)
     }
@@ -197,6 +208,16 @@ packages:
         let data = PackageData::from_file(&path).unwrap();
         assert_eq!(data.package_count(), 3);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn vulnerability_labels_match_data_file_names() {
+        assert_eq!(Vulnerability::Malware.label(), "malware");
+        assert_eq!(Vulnerability::Typosquatting.label(), "typosquatting");
+        assert_eq!(
+            Vulnerability::DependencyConfusion.label(),
+            "dependency_confusion"
+        );
     }
 
     #[test]

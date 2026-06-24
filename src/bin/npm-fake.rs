@@ -23,15 +23,22 @@ const NPM_ACCEPT: &str = "application/vnd.npm.install-v1+json; q=1.0, applicatio
 #[command(name = "npm-fake", version, about)]
 struct Cli {
     /// Package to fetch, e.g. `lodash` or a scoped name like `@types/node`.
-    package: String,
+    #[arg(required_unless_present = "purl", conflicts_with = "purl")]
+    package: Option<String>,
 
     /// Port the package-chain-gate proxy is listening on.
     #[arg(long, value_name = "PORT", default_value_t = 4873)]
     proxy_port: u16,
 
     /// Also download the tarball for this version, e.g. `4.17.21`.
-    #[arg(long, value_name = "VERSION")]
+    #[arg(long, value_name = "VERSION", conflicts_with = "purl")]
     tarball: Option<String>,
+
+    /// Full npm purl to fetch, e.g. `pkg:npm/lodash@4.17.21`. The version, when
+    /// present, is fetched as a tarball. Mutually exclusive with the package
+    /// argument and `--tarball`.
+    #[arg(long, value_name = "PURL")]
+    purl: Option<String>,
 }
 
 #[tokio::main]
@@ -50,22 +57,61 @@ async fn run_cli(cli: Cli) -> ExitCode {
     }
 }
 
-/// Issues the npm-style requests for the given package against the proxy.
+/// Issues the npm-style requests for the requested package against the proxy.
 async fn run(cli: Cli) -> Result<(), BoxError> {
+    let (package, version) = resolve_target(&cli)?;
+
     let base = format!("http://localhost:{}", cli.proxy_port);
     let client = reqwest::Client::new();
 
     // Fetch package metadata, just as npm does first during an install.
-    let metadata_url = format!("{base}/{}", encode_package(&cli.package));
+    let metadata_url = format!("{base}/{}", encode_package(&package));
     fetch(&client, &metadata_url, "metadata").await?;
 
     // Optionally fetch the tarball, the second request npm makes per package.
-    if let Some(version) = &cli.tarball {
-        let tarball_url = format!("{base}/{}", tarball_path(&cli.package, version));
+    if let Some(version) = &version {
+        let tarball_url = format!("{base}/{}", tarball_path(&package, version));
         fetch(&client, &tarball_url, "tarball").await?;
     }
 
     Ok(())
+}
+
+/// Resolves the package name and optional version to fetch, from either a
+/// `--purl` or the package argument plus `--tarball`.
+fn resolve_target(cli: &Cli) -> Result<(String, Option<String>), BoxError> {
+    match (&cli.purl, &cli.package) {
+        (Some(purl), _) => {
+            parse_npm_purl(purl).ok_or_else(|| format!("invalid npm purl: {purl}").into())
+        }
+        (None, Some(package)) => Ok((package.clone(), cli.tarball.clone())),
+        (None, None) => Err("a package name or --purl is required".into()),
+    }
+}
+
+/// Parses an npm purl (`pkg:npm/<name>[@<version>]`) into its package name and
+/// optional version. Returns `None` for non-npm purls or an empty name/version.
+fn parse_npm_purl(purl: &str) -> Option<(String, Option<String>)> {
+    let rest = purl.strip_prefix("pkg:npm/")?;
+    // Drop any purl qualifiers (`?...`) or subpath (`#...`).
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+
+    // The version follows the last `@`; a leading `@` (index 0) is the scope
+    // marker of a scoped name, not a version separator.
+    match rest.rfind('@') {
+        Some(idx) if idx > 0 => {
+            let version = &rest[idx + 1..];
+            if version.is_empty() {
+                None
+            } else {
+                Some((rest[..idx].to_owned(), Some(version.to_owned())))
+            }
+        }
+        _ => Some((rest.to_owned(), None)),
+    }
 }
 
 /// Issues a single npm-style GET request and reports the outcome.
@@ -85,10 +131,19 @@ async fn fetch(client: &reqwest::Client, url: &str, kind: &str) -> Result<(), Bo
     println!("  <- {} ({} bytes)", status, body.len());
 
     if status.is_success() {
-        Ok(())
-    } else {
-        Err(format!("{kind} request failed with status {status}").into())
+        return Ok(());
     }
+
+    // Surface the response body as the failure reason; for blocked packages the
+    // proxy returns a body naming the package and its vulnerabilities.
+    let reason = String::from_utf8_lossy(&body);
+    let reason = reason.trim();
+    let message = if reason.is_empty() {
+        format!("{kind} request failed with status {status}")
+    } else {
+        format!("{kind} request failed with status {status}: {reason}")
+    };
+    Err(message.into())
 }
 
 /// Builds the metadata request path for a package name.
@@ -138,12 +193,18 @@ mod tests {
                 tokio::spawn(async move {
                     let io = TokioIo::new(socket);
                     let service = service_fn(|req: Request<Incoming>| async move {
-                        let status = if req.uri().path().contains("missing") {
-                            StatusCode::NOT_FOUND
-                        } else {
-                            StatusCode::OK
-                        };
-                        let mut response = Response::new(Full::new(Bytes::from_static(b"body")));
+                        let path = req.uri().path();
+                        let (status, body): (StatusCode, &'static [u8]) =
+                            if path.contains("blocked") {
+                                (StatusCode::FORBIDDEN, b"package is blocked (malware)")
+                            } else if path.contains("noreason") {
+                                (StatusCode::INTERNAL_SERVER_ERROR, b"")
+                            } else if path.contains("missing") {
+                                (StatusCode::NOT_FOUND, b"body")
+                            } else {
+                                (StatusCode::OK, b"body")
+                            };
+                        let mut response = Response::new(Full::new(Bytes::from_static(body)));
                         *response.status_mut() = status;
                         Ok::<_, std::convert::Infallible>(response)
                     });
@@ -159,9 +220,19 @@ mod tests {
 
     fn cli(package: &str, port: u16, tarball: Option<&str>) -> Cli {
         Cli {
-            package: package.to_owned(),
+            package: Some(package.to_owned()),
             proxy_port: port,
             tarball: tarball.map(str::to_owned),
+            purl: None,
+        }
+    }
+
+    fn cli_purl(purl: &str, port: u16) -> Cli {
+        Cli {
+            package: None,
+            proxy_port: port,
+            tarball: None,
+            purl: Some(purl.to_owned()),
         }
     }
 
@@ -195,7 +266,7 @@ mod tests {
     fn proxy_port_defaults_to_4873() {
         let parsed = Cli::try_parse_from(["npm-fake", "lodash"]).unwrap();
         assert_eq!(parsed.proxy_port, 4873);
-        assert_eq!(parsed.package, "lodash");
+        assert_eq!(parsed.package.as_deref(), Some("lodash"));
         assert!(parsed.tarball.is_none());
     }
 
@@ -216,7 +287,122 @@ mod tests {
 
     #[test]
     fn package_argument_is_required() {
+        // Neither a package nor a purl is provided.
         assert!(Cli::try_parse_from(["npm-fake"]).is_err());
+    }
+
+    #[test]
+    fn purl_alone_is_accepted() {
+        let parsed = Cli::try_parse_from(["npm-fake", "--purl", "pkg:npm/lodash@4.17.21"]).unwrap();
+        assert_eq!(parsed.purl.as_deref(), Some("pkg:npm/lodash@4.17.21"));
+        assert!(parsed.package.is_none());
+    }
+
+    #[test]
+    fn purl_conflicts_with_package() {
+        let result = Cli::try_parse_from(["npm-fake", "lodash", "--purl", "pkg:npm/lodash@1.0.0"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn purl_conflicts_with_tarball() {
+        let result = Cli::try_parse_from([
+            "npm-fake",
+            "--purl",
+            "pkg:npm/lodash@1.0.0",
+            "--tarball",
+            "1.0.0",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_npm_purl_unscoped_with_version() {
+        assert_eq!(
+            parse_npm_purl("pkg:npm/lodash@4.17.21"),
+            Some(("lodash".to_owned(), Some("4.17.21".to_owned())))
+        );
+    }
+
+    #[test]
+    fn parse_npm_purl_unscoped_without_version() {
+        assert_eq!(
+            parse_npm_purl("pkg:npm/lodash"),
+            Some(("lodash".to_owned(), None))
+        );
+    }
+
+    #[test]
+    fn parse_npm_purl_scoped_with_version() {
+        assert_eq!(
+            parse_npm_purl("pkg:npm/@babel/core@7.0.0"),
+            Some(("@babel/core".to_owned(), Some("7.0.0".to_owned())))
+        );
+    }
+
+    #[test]
+    fn parse_npm_purl_scoped_without_version() {
+        assert_eq!(
+            parse_npm_purl("pkg:npm/@types/node"),
+            Some(("@types/node".to_owned(), None))
+        );
+    }
+
+    #[test]
+    fn parse_npm_purl_strips_qualifiers() {
+        assert_eq!(
+            parse_npm_purl("pkg:npm/lodash@4.17.21?arch=x64#sub"),
+            Some(("lodash".to_owned(), Some("4.17.21".to_owned())))
+        );
+    }
+
+    #[test]
+    fn parse_npm_purl_rejects_non_npm() {
+        assert!(parse_npm_purl("pkg:pypi/requests@2.0.0").is_none());
+    }
+
+    #[test]
+    fn parse_npm_purl_rejects_empty_name() {
+        assert!(parse_npm_purl("pkg:npm/").is_none());
+    }
+
+    #[test]
+    fn parse_npm_purl_rejects_trailing_at() {
+        assert!(parse_npm_purl("pkg:npm/lodash@").is_none());
+    }
+
+    #[test]
+    fn resolve_target_from_purl() {
+        let target = resolve_target(&cli_purl("pkg:npm/lodash@4.17.21", 4873)).unwrap();
+        assert_eq!(target, ("lodash".to_owned(), Some("4.17.21".to_owned())));
+    }
+
+    #[test]
+    fn resolve_target_from_invalid_purl_is_error() {
+        assert!(resolve_target(&cli_purl("not-a-purl", 4873)).is_err());
+    }
+
+    #[test]
+    fn resolve_target_from_package_and_tarball() {
+        let target = resolve_target(&cli("lodash", 4873, Some("4.17.21"))).unwrap();
+        assert_eq!(target, ("lodash".to_owned(), Some("4.17.21".to_owned())));
+    }
+
+    #[test]
+    fn resolve_target_errors_without_package_or_purl() {
+        let empty = Cli {
+            package: None,
+            proxy_port: 4873,
+            tarball: None,
+            purl: None,
+        };
+        assert!(resolve_target(&empty).is_err());
+    }
+
+    #[tokio::test]
+    async fn run_fetches_via_purl() {
+        let port = spawn_stub().await;
+        assert!(run(cli_purl("pkg:npm/lodash@4.17.21", port)).await.is_ok());
     }
 
     #[tokio::test]
@@ -235,6 +421,32 @@ mod tests {
     async fn run_errors_when_request_fails() {
         let port = spawn_stub().await;
         assert!(run(cli("missing-pkg", port, None)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failure_includes_response_body_reason() {
+        let port = spawn_stub().await;
+        let client = reqwest::Client::new();
+        let url = format!("http://localhost:{port}/blocked-pkg");
+
+        let err = fetch(&client, &url, "metadata").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "metadata request failed with status 403 Forbidden: package is blocked (malware)"
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_with_empty_body_reports_only_status() {
+        let port = spawn_stub().await;
+        let client = reqwest::Client::new();
+        let url = format!("http://localhost:{port}/noreason");
+
+        let err = fetch(&client, &url, "metadata").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "metadata request failed with status 500 Internal Server Error"
+        );
     }
 
     #[tokio::test]

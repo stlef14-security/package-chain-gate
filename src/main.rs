@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::path::PathBuf;
@@ -9,14 +10,14 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, TRANSFER_ENCODING};
 use hyper::service::service_fn;
-use hyper::{Request, Response};
+use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use reqwest::Method;
 use tokio::net::{TcpListener, TcpStream};
 
 mod package_data;
 
-use package_data::PackageData;
+use package_data::{PackageData, Vulnerability};
 
 /// Upstream npm registry that allowed requests are forwarded to.
 const NPM_REGISTRY: &str = "https://registry.npmjs.org";
@@ -61,7 +62,13 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
         listener.local_addr()?
     );
 
-    serve(listener, reqwest::Client::new(), Arc::from(NPM_REGISTRY)).await
+    serve(
+        listener,
+        reqwest::Client::new(),
+        Arc::from(NPM_REGISTRY),
+        Arc::new(package_data),
+    )
+    .await
 }
 
 /// Loads package vulnerability data from the given path, or returns an empty
@@ -78,16 +85,18 @@ async fn serve(
     listener: TcpListener,
     client: reqwest::Client,
     upstream: Arc<str>,
+    package_data: Arc<PackageData>,
 ) -> Result<(), BoxError> {
     loop {
         let (socket, peer) = listener.accept().await?;
         let client = client.clone();
         let upstream = Arc::clone(&upstream);
+        let package_data = Arc::clone(&package_data);
 
         // Each connection is handled independently so a slow client can't block
         // the accept loop.
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(socket, client, upstream).await {
+            if let Err(err) = handle_connection(socket, client, upstream, package_data).await {
                 eprintln!("connection from {peer} failed: {err}");
             }
         });
@@ -99,9 +108,17 @@ async fn handle_connection(
     socket: TcpStream,
     client: reqwest::Client,
     upstream: Arc<str>,
+    package_data: Arc<PackageData>,
 ) -> Result<(), BoxError> {
     let io = TokioIo::new(socket);
-    let service = service_fn(move |req| proxy(req, client.clone(), Arc::clone(&upstream)));
+    let service = service_fn(move |req| {
+        proxy(
+            req,
+            client.clone(),
+            Arc::clone(&upstream),
+            Arc::clone(&package_data),
+        )
+    });
 
     hyper::server::conn::http1::Builder::new()
         .serve_connection(io, service)
@@ -109,17 +126,23 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Proxies a single npm request to the upstream registry and relays the response
-/// back to the client.
-///
-/// TODO: before forwarding, screen the requested package for supply-chain risks
-/// (malware, typosquatting, dependency confusion) and block disallowed requests.
+/// Proxies a single npm request to the upstream registry, unless the requested
+/// package is known to be vulnerable, in which case it is blocked.
 async fn proxy(
     req: Request<Incoming>,
     client: reqwest::Client,
     upstream: Arc<str>,
+    package_data: Arc<PackageData>,
 ) -> Result<Response<Full<Bytes>>, BoxError> {
     let (parts, body) = req.into_parts();
+
+    // Block the request when the requested package's purl is known to carry a
+    // vulnerability; otherwise let it through to the registry.
+    if let Some(purl) = npm_purl(parts.uri.path())
+        && let Some(vulnerabilities) = package_data.lookup(&purl)
+    {
+        return Ok(forbidden(&purl, vulnerabilities));
+    }
 
     // Preserve the original path and query (e.g. `/lodash` or
     // `/lodash/-/lodash-4.17.21.tgz`) when targeting the registry.
@@ -140,6 +163,52 @@ async fn proxy(
         body,
     )
     .await
+}
+
+/// Derives the npm [purl] for a proxied request path, or `None` when the path is
+/// not a package request (e.g. the registry root).
+///
+/// Tarball requests carry a version (`/lodash/-/lodash-4.17.21.tgz` →
+/// `pkg:npm/lodash@4.17.21`); metadata requests do not (`/lodash` →
+/// `pkg:npm/lodash`). Scoped names use a percent-encoded slash in metadata
+/// paths (`/@types%2fnode`) and a literal slash in tarball paths.
+///
+/// [purl]: https://github.com/package-url/purl-spec
+fn npm_purl(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+    if path.is_empty() {
+        return None;
+    }
+    let path = path.replace("%2f", "/").replace("%2F", "/");
+
+    if let Some((name, file)) = path.split_once("/-/") {
+        let version = tarball_version(name, file)?;
+        Some(format!("pkg:npm/{name}@{version}"))
+    } else {
+        Some(format!("pkg:npm/{path}"))
+    }
+}
+
+/// Extracts the version from a tarball filename, given the package name. The
+/// filename uses the unscoped package name, so `@babel/core` + `core-7.0.0.tgz`
+/// yields `7.0.0`.
+fn tarball_version(name: &str, file: &str) -> Option<String> {
+    let stem = file.strip_suffix(".tgz")?;
+    let unscoped = name.rsplit('/').next().unwrap_or(name);
+    stem.strip_prefix(&format!("{unscoped}-"))
+        .map(ToOwned::to_owned)
+}
+
+/// Builds a `403 Forbidden` response naming the blocked package and the
+/// vulnerabilities it carries.
+fn forbidden(purl: &str, vulnerabilities: &HashSet<Vulnerability>) -> Response<Full<Bytes>> {
+    let mut labels: Vec<&str> = vulnerabilities.iter().map(|v| v.label()).collect();
+    labels.sort_unstable();
+
+    let body = format!("{purl} is blocked ({})\n", labels.join(", "));
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    response
 }
 
 /// Forwards a request to the upstream registry and builds a relayed response.
@@ -222,12 +291,23 @@ mod tests {
         Arc::from(format!("http://{addr}"))
     }
 
-    /// Spawns the proxy in front of the given upstream and returns its socket
-    /// address as `host:port`.
+    /// Spawns the proxy in front of the given upstream with empty package data
+    /// (so every request is forwarded), returning its `host:port`.
     async fn spawn_proxy(upstream: Arc<str>) -> String {
+        spawn_proxy_with_data(upstream, PackageData::default()).await
+    }
+
+    /// Spawns the proxy in front of the given upstream with the given package
+    /// data, returning its `host:port`.
+    async fn spawn_proxy_with_data(upstream: Arc<str>, package_data: PackageData) -> String {
         let listener = TcpListener::bind(listen_addr(0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, reqwest::Client::new(), upstream));
+        tokio::spawn(serve(
+            listener,
+            reqwest::Client::new(),
+            upstream,
+            Arc::new(package_data),
+        ));
         addr.to_string()
     }
 
@@ -439,5 +519,140 @@ mod tests {
         let _ = stream.read_to_end(&mut buf).await;
         // Let the spawned task run its error branch before the test ends.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // --- Step 2: blocking vulnerable packages ---
+
+    fn package_data_with(entries: &[(&str, &[&str])]) -> PackageData {
+        use std::fmt::Write as _;
+
+        let mut yaml = String::from("packages:\n");
+        for (purl, vulns) in entries {
+            let _ = writeln!(yaml, "  - {purl}:");
+            for vuln in *vulns {
+                let _ = writeln!(yaml, "    - {vuln}");
+            }
+        }
+        PackageData::from_yaml(&yaml).unwrap()
+    }
+
+    #[test]
+    fn npm_purl_for_unscoped_metadata() {
+        assert_eq!(npm_purl("/lodash").as_deref(), Some("pkg:npm/lodash"));
+    }
+
+    #[test]
+    fn npm_purl_for_scoped_metadata_decodes_slash() {
+        assert_eq!(
+            npm_purl("/@types%2fnode").as_deref(),
+            Some("pkg:npm/@types/node")
+        );
+    }
+
+    #[test]
+    fn npm_purl_for_unscoped_tarball_includes_version() {
+        assert_eq!(
+            npm_purl("/lodash/-/lodash-4.17.21.tgz").as_deref(),
+            Some("pkg:npm/lodash@4.17.21")
+        );
+    }
+
+    #[test]
+    fn npm_purl_for_scoped_tarball_uses_scoped_name_and_version() {
+        assert_eq!(
+            npm_purl("/@babel/core/-/core-7.0.0.tgz").as_deref(),
+            Some("pkg:npm/@babel/core@7.0.0")
+        );
+    }
+
+    #[test]
+    fn npm_purl_is_none_for_root() {
+        assert!(npm_purl("/").is_none());
+    }
+
+    #[test]
+    fn npm_purl_is_none_for_malformed_tarball() {
+        // Missing the `.tgz` suffix means no version can be extracted.
+        assert!(npm_purl("/lodash/-/lodash-4.17.21").is_none());
+    }
+
+    #[tokio::test]
+    async fn forbidden_response_lists_sorted_vulnerabilities() {
+        let vulns = HashSet::from([Vulnerability::Malware, Vulnerability::DependencyConfusion]);
+        let response = forbidden("pkg:npm/axios@1.9.3", &vulns);
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("pkg:npm/axios@1.9.3"));
+        // Labels are sorted, so order is deterministic.
+        assert!(body.contains("dependency_confusion, malware"));
+    }
+
+    #[tokio::test]
+    async fn blocks_vulnerable_tarball_with_403() {
+        let upstream = spawn_stub_registry().await;
+        let data = package_data_with(&[("pkg:npm/lodash@4.17.21", &["malware"])]);
+        let proxy = spawn_proxy_with_data(upstream, data).await;
+
+        let response = reqwest::get(format!("http://{proxy}/lodash/-/lodash-4.17.21.tgz"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 403);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("pkg:npm/lodash@4.17.21"));
+        assert!(body.contains("malware"));
+    }
+
+    #[tokio::test]
+    async fn block_response_names_all_vulnerabilities() {
+        let upstream = spawn_stub_registry().await;
+        let data =
+            package_data_with(&[("pkg:npm/axios@1.9.3", &["malware", "dependency_confusion"])]);
+        let proxy = spawn_proxy_with_data(upstream, data).await;
+
+        let response = reqwest::get(format!("http://{proxy}/axios/-/axios-1.9.3.tgz"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 403);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("malware"));
+        assert!(body.contains("dependency_confusion"));
+    }
+
+    #[tokio::test]
+    async fn forwards_when_package_not_in_data() {
+        let upstream = spawn_stub_registry().await;
+        let data = package_data_with(&[("pkg:npm/lodash@4.17.21", &["malware"])]);
+        let proxy = spawn_proxy_with_data(upstream, data).await;
+
+        // A different version is not in the data, so it is forwarded.
+        let response = reqwest::get(format!("http://{proxy}/lodash/-/lodash-4.17.20.tgz"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.text().await.unwrap(),
+            "upstream:/lodash/-/lodash-4.17.20.tgz"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwards_metadata_even_for_vulnerable_package() {
+        let upstream = spawn_stub_registry().await;
+        let data = package_data_with(&[("pkg:npm/lodash@4.17.21", &["malware"])]);
+        let proxy = spawn_proxy_with_data(upstream, data).await;
+
+        // Metadata requests carry no version, so they do not match a versioned
+        // purl and are forwarded; blocking happens at the tarball fetch.
+        let response = reqwest::get(format!("http://{proxy}/lodash"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "upstream:/lodash");
     }
 }
