@@ -175,4 +175,30 @@ On startup the file is parsed into an in-memory model that supports lookups by
 purl, which the proxy uses to block requests for known-vulnerable packages (see
 [How it works](#how-it-works)).
 
+## Updating package data
+
+`--update-package` refreshes the local package-data file from the latest
+[release](https://github.com/stlef14-security/package-data/releases/latest),
+then exits without starting the proxy:
+
+```sh
+# Updates ./package_data.yaml
+package-chain-gate --update-package
+
+# Update a file at a specific path
+package-chain-gate --update-package --package-config /etc/pcg/package_data.yaml
+```
+
+The update is version-aware and integrity-checked:
+
+1. The latest release's version (tag) is compared with the locally cached
+   version (recorded in a `<file>.version` sidecar). If they match, nothing is
+   downloaded.
+2. Otherwise the release's `package_data.yaml` and `package_data.yaml.sha256`
+   assets are downloaded; the file's sha256 is computed and compared with the
+   published checksum.
+3. On a match the local file is replaced atomically and the version is recorded;
+   on a mismatch the update is aborted with an error and the existing file is
+   left untouched.
+
 
