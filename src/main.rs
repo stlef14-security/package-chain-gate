@@ -15,6 +15,7 @@ use hyper_util::rt::TokioIo;
 use reqwest::Method;
 use tokio::net::{TcpListener, TcpStream};
 
+mod mcp;
 mod package_data;
 mod updater;
 
@@ -45,6 +46,10 @@ struct Cli {
     /// Update the local package-data file from the latest release, then exit.
     #[arg(long)]
     update_package: bool,
+
+    /// Run an MCP server (Streamable HTTP) on this port instead of the proxy.
+    #[arg(long, value_name = "PORT")]
+    mcp_port: Option<u16>,
 }
 
 /// Builds the local address the proxy listens on for the given port.
@@ -92,9 +97,11 @@ async fn update_package_data(cli: &Cli, api_url: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Binds the proxy listener and serves requests until the process is stopped.
+/// Binds the proxy listener (and the MCP listener when `--mcp-port` is set) and
+/// serves both until the process is stopped. The two listeners are independent
+/// and share the same package data.
 async fn run(cli: Cli) -> Result<(), BoxError> {
-    let package_data = load_package_data(cli.package_config.as_deref())?;
+    let package_data = Arc::new(load_package_data(cli.package_config.as_deref())?);
     println!(
         "loaded vulnerability data for {} package(s)",
         package_data.package_count()
@@ -106,13 +113,26 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
         listener.local_addr()?
     );
 
-    serve(
+    let proxy = serve(
         listener,
         reqwest::Client::new(),
         Arc::from(NPM_REGISTRY),
-        Arc::new(package_data),
-    )
-    .await
+        Arc::clone(&package_data),
+    );
+
+    // When configured, run the MCP server alongside the proxy on its own port.
+    if let Some(mcp_port) = cli.mcp_port {
+        let mcp_listener = TcpListener::bind(listen_addr(mcp_port)).await?;
+        println!(
+            "package-chain-gate MCP server listening on {}",
+            mcp_listener.local_addr()?
+        );
+        let mcp = mcp::serve(mcp_listener, package_data);
+        tokio::try_join!(proxy, mcp)?;
+        Ok(())
+    } else {
+        proxy.await
+    }
 }
 
 /// Loads package vulnerability data from the given path, or returns an empty
@@ -454,12 +474,29 @@ mod tests {
                 proxy_port: 0,
                 package_config: None,
                 update_package: false,
+                mcp_port: None,
             }),
         )
         .await;
         assert!(
             outcome.is_err(),
             "run() should still be serving when cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_serves_proxy_and_mcp_together() {
+        let cli = Cli {
+            proxy_port: 0,
+            package_config: None,
+            update_package: false,
+            mcp_port: Some(0),
+        };
+        // Both listeners use a free port; they run until the timeout cancels them.
+        let outcome = tokio::time::timeout(Duration::from_millis(100), run(cli)).await;
+        assert!(
+            outcome.is_err(),
+            "run() should still be serving proxy + MCP when cancelled"
         );
     }
 
@@ -741,6 +778,7 @@ mod tests {
             proxy_port: 4873,
             package_config: Some(target.clone()),
             update_package: true,
+            mcp_port: None,
         };
 
         update_package_data(&cli, &format!("{base}/releases/latest"))

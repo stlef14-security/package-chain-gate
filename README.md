@@ -77,6 +77,63 @@ cargo run --bin npm-fake -- @types/node --proxy-port 8080
 ./target/debug/npm-fake --purl pkg:npm/react@19.2.7
 ```
 
+## MCP server
+
+`--mcp-port <PORT>` additionally starts an [MCP](https://modelcontextprotocol.io)
+server, backed by the same package data. It runs **alongside** the proxy (which
+keeps listening on `--proxy-port`); the two are independent listeners:
+
+```sh
+# Proxy on 4873 AND MCP server on 8090
+package-chain-gate --mcp-port 8090 --package-config package_data.yaml
+```
+
+It exposes one tool, **`package_check`**, which takes an `ecosystem` (e.g.
+`npm`), `name` (e.g. `react`), and `version` (e.g. `19.2.7`). It builds the purl
+`pkg:<ecosystem>/<name>@<version>` and looks it up in the package data:
+
+- If the package is listed, the tool reports that it **must not be used** and
+  names the vulnerabilities (e.g. `malware`).
+- Otherwise it reports that the package appears safe to add.
+
+The tool's description instructs clients to always call `package_check` before
+adding a dependency or changing a version.
+
+### Connecting
+
+The server speaks the MCP **Streamable HTTP** transport over **plain HTTP** (no
+TLS). Point your MCP client at:
+
+```
+http://127.0.0.1:8090
+```
+
+> ⚠️ Use `http://`, not `https://`. The server does not serve TLS, so an
+> `https://` URL fails with a connection error.
+
+Transport details:
+
+- Clients **POST** JSON-RPC messages to the URL; requests receive a JSON
+  response, notifications receive `202 Accepted`.
+- The server does not offer a server-to-client SSE stream, so a `GET` to the
+  endpoint returns `405 Method Not Allowed` (expected for this transport).
+- The server is stateless — it does not issue an `Mcp-Session-Id`.
+
+With the [MCP Inspector](https://github.com/modelcontextprotocol/inspector):
+
+```sh
+npx @modelcontextprotocol/inspector
+# Transport: Streamable HTTP    URL: http://127.0.0.1:8090
+```
+
+Or exercise it directly with `curl`:
+
+```sh
+curl -s http://127.0.0.1:8090 \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"package_check","arguments":{"ecosystem":"npm","name":"react","version":"18.3.1"}}}'
+```
+
 ## How it works
 
 The gate runs as an HTTP reverse proxy in front of the public npm registry
