@@ -69,18 +69,30 @@ cargo run --bin npm-fake -- lodash --tarball 4.17.21
 
 # Scoped packages and a custom proxy port
 cargo run --bin npm-fake -- @types/node --proxy-port 8080
+
+# if you built it, run npm-fake with a purl
+# this gets blocked with the example package_data.yaml (malware)
+./target/debug/npm-fake --purl pkg:npm/lodash@4.17.21
+# this works with package_data.yaml
+./target/debug/npm-fake --purl pkg:npm/react@19.2.7
 ```
 
 ## How it works
 
 The gate runs as an HTTP reverse proxy in front of the public npm registry
-(`https://registry.npmjs.org`). Incoming requests (package metadata lookups,
-tarball downloads, etc.) are forwarded upstream with their path and query
-preserved, and the registry's response is relayed back to the client.
+(`https://registry.npmjs.org`). For each request it derives the package's purl
+from the request path and looks it up in the loaded package data:
 
-Supply-chain screening of the requested package (malware, typosquatting,
-dependency confusion) is not yet implemented — every request is currently passed
-through unchanged.
+- If the purl is found, the package is **blocked**: the request is not forwarded,
+  and the gate replies `403 Forbidden` with a body naming the package and its
+  vulnerabilities (e.g. `malware`, `typosquatting`, `dependency_confusion`).
+- Otherwise the request is forwarded upstream with its path and query preserved,
+  and the registry's response is relayed back to the client.
+
+Because the purl includes a version, blocking applies to versioned tarball
+requests (`/lodash/-/lodash-4.17.21.tgz` → `pkg:npm/lodash@4.17.21`). Metadata
+requests carry no version and are forwarded. When no `--package-config` is
+given, the package data is empty and every request is forwarded.
 
 ## Test
 
@@ -160,4 +172,7 @@ packages:
 ```
 
 On startup the file is parsed into an in-memory model that supports lookups by
-purl. (Acting on those lookups to block requests is a later step.)
+purl, which the proxy uses to block requests for known-vulnerable packages (see
+[How it works](#how-it-works)).
+
+
