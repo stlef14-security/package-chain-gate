@@ -16,11 +16,16 @@ use reqwest::Method;
 use tokio::net::{TcpListener, TcpStream};
 
 mod package_data;
+mod updater;
 
 use package_data::{PackageData, Vulnerability};
+use updater::UpdateOutcome;
 
 /// Upstream npm registry that allowed requests are forwarded to.
 const NPM_REGISTRY: &str = "https://registry.npmjs.org";
+
+/// Default package-data file used when `--package-config` is not given.
+const DEFAULT_PACKAGE_DATA: &str = "package_data.yaml";
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -36,6 +41,10 @@ struct Cli {
     /// Path to the package vulnerability data file (YAML).
     #[arg(long, value_name = "PATH")]
     package_config: Option<PathBuf>,
+
+    /// Update the local package-data file from the latest release, then exit.
+    #[arg(long)]
+    update_package: bool,
 }
 
 /// Builds the local address the proxy listens on for the given port.
@@ -45,7 +54,42 @@ fn listen_addr(port: u16) -> SocketAddr {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    run(Cli::parse()).await
+    let cli = Cli::parse();
+    if cli.update_package {
+        update_package_data(&cli, updater::RELEASES_API).await
+    } else {
+        run(cli).await
+    }
+}
+
+/// Resolves the package-data file to read/update from the CLI, falling back to
+/// the default path.
+fn package_data_target(cli: &Cli) -> PathBuf {
+    cli.package_config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PACKAGE_DATA))
+}
+
+/// Updates the local package-data file from the latest release and reports the
+/// outcome.
+async fn update_package_data(cli: &Cli, api_url: &str) -> Result<(), BoxError> {
+    let target = package_data_target(cli);
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("package-chain-gate/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    match updater::update_package(&client, api_url, &target).await? {
+        UpdateOutcome::UpToDate { version } => {
+            println!("package data is already up to date (version {version})");
+        }
+        UpdateOutcome::Updated { version } => {
+            println!(
+                "updated package data to version {version} ({})",
+                target.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Binds the proxy listener and serves requests until the process is stopped.
@@ -409,6 +453,7 @@ mod tests {
             run(Cli {
                 proxy_port: 0,
                 package_config: None,
+                update_package: false,
             }),
         )
         .await;
@@ -654,5 +699,64 @@ mod tests {
 
         assert_eq!(response.status(), 200);
         assert_eq!(response.text().await.unwrap(), "upstream:/lodash");
+    }
+
+    // --- Step 3: updating package data ---
+
+    #[test]
+    fn package_data_target_defaults_to_package_data_yaml() {
+        let cli = Cli::try_parse_from(["package-chain-gate", "--update-package"]).unwrap();
+        assert_eq!(
+            package_data_target(&cli),
+            PathBuf::from(DEFAULT_PACKAGE_DATA)
+        );
+    }
+
+    #[test]
+    fn package_data_target_uses_package_config_when_set() {
+        let cli = Cli::try_parse_from([
+            "package-chain-gate",
+            "--update-package",
+            "--package-config",
+            "custom.yaml",
+        ])
+        .unwrap();
+        assert_eq!(package_data_target(&cli), PathBuf::from("custom.yaml"));
+    }
+
+    #[tokio::test]
+    async fn update_package_data_downloads_and_reports() {
+        use updater::test_support::{ReleaseSpec, sha256_hex, spawn_release_server};
+
+        let target = std::env::temp_dir().join(format!("pcg-main-upd-{}.yaml", std::process::id()));
+        let data = b"package data".to_vec();
+        let base = spawn_release_server(ReleaseSpec {
+            tag: "v9.9.9".to_owned(),
+            data: Some(data.clone()),
+            sha: Some(sha256_hex(&data)),
+        })
+        .await;
+
+        let cli = Cli {
+            proxy_port: 4873,
+            package_config: Some(target.clone()),
+            update_package: true,
+        };
+
+        update_package_data(&cli, &format!("{base}/releases/latest"))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), data);
+
+        // A second run reports "up to date" (version sidecar now matches).
+        update_package_data(&cli, &format!("{base}/releases/latest"))
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(target.with_file_name(format!(
+            "{}.version",
+            target.file_name().unwrap().to_str().unwrap()
+        )));
     }
 }
